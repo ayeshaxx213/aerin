@@ -1,138 +1,362 @@
+
 import os
+import sqlite3
 import secrets
-import threading
-from functools import wraps
+import string
+import logging
 
 import discord
 from discord import app_commands
-from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from discord.ext import commands
 
-load_dotenv()
+# ---------------- CONFIG ----------------
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-API_SECRET = os.getenv("API_SECRET", "")
-ADMIN_IDS = {
-    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",")
-    if x.strip().isdigit()
-}
-HOST = os.getenv("API_HOST", "127.0.0.1")
-PORT = int(os.getenv("API_PORT", "5000"))
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
+VERIFIED_ROLE_ID = int(os.getenv("VERIFIED_ROLE_ID", "0") or "0")
+SCRIPT_URL = os.getenv("SCRIPT_URL", "").strip()
+DATABASE = os.getenv("DATABASE_PATH", "aerin.sqlite3")
 
-# Demo storage: keys and bindings are kept in memory and reset when the process stops.
-# Use a database for production deployments.
-keys = {}       # key -> {"roblox_user_id": int | None, "active": bool}
-bindings = {}   # Roblox UserId -> key
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
 
-app = Flask(__name__)
-
-def require_api_secret(fn):
-    @wraps(fn)
-    def wrapped(*args, **kwargs):
-        if not API_SECRET or request.headers.get("X-API-SECRET") != API_SECRET:
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
-    return wrapped
-
-@app.post("/validate")
-@require_api_secret
-def validate_key():
-    data = request.get_json(silent=True) or {}
-    key = str(data.get("key", "")).strip()
-    try:
-        user_id = int(data.get("roblox_user_id"))
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "invalid_user_id"}), 400
-
-    record = keys.get(key)
-    if not record or not record["active"]:
-        return jsonify({"ok": False, "error": "invalid_key"}), 403
-
-    bound_id = record["roblox_user_id"]
-    if bound_id is None:
-        if user_id in bindings:
-            return jsonify({"ok": False, "error": "account_already_bound"}), 403
-        record["roblox_user_id"] = user_id
-        bindings[user_id] = key
-    elif bound_id != user_id:
-        return jsonify({"ok": False, "error": "key_bound_to_another_account"}), 403
-
-    return jsonify({"ok": True, "message": "authorized"})
-
-@app.get("/health")
-def health():
-    return jsonify({"ok": True})
-
-def run_api():
-    app.run(host=HOST, port=PORT, threaded=True)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("aerin")
 
 intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+intents.members = True
 
-def is_admin(interaction: discord.Interaction) -> bool:
-    return interaction.user.id in ADMIN_IDS
 
-@tree.command(name="generatekey", description="Generate a one-time Roblox registration key")
-@app_commands.describe(amount="Number of keys to create (1-10)")
-async def generatekey(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 10] = 1):
-    if not is_admin(interaction):
-        await interaction.response.send_message("You are not authorized.", ephemeral=True)
-        return
-    made = []
-    for _ in range(amount):
-        key = "AY-" + secrets.token_urlsafe(18)
-        keys[key] = {"roblox_user_id": None, "active": True}
-        made.append(key)
-    await interaction.response.send_message(
-        "Generated key(s):\n" + "\n".join(f"`{k}`" for k in made),
-        ephemeral=True
+# ---------------- DATABASE ----------------
+
+def db():
+    con = sqlite3.connect(DATABASE)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def setup_database():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS keys (
+                key TEXT PRIMARY KEY,
+                redeemed_by TEXT,
+                redeemed_at TEXT
+            )
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                discord_id TEXT PRIMARY KEY,
+                hwid TEXT
+            )
+        """)
+
+
+def create_key():
+    chars = string.ascii_uppercase + string.digits
+    code = "".join(secrets.choice(chars) for _ in range(8))
+    return f"AERIN-VLSD-{code}-EL"
+
+
+def is_verified(user_id):
+    with db() as con:
+        return con.execute(
+            "SELECT 1 FROM keys WHERE redeemed_by = ? LIMIT 1",
+            (str(user_id),)
+        ).fetchone() is not None
+
+
+# ---------------- REDEEM MODAL ----------------
+
+class RedeemModal(discord.ui.Modal, title="Redeem Aerin Key"):
+
+    key = discord.ui.TextInput(
+        label="Enter your Aerin key",
+        placeholder="AERIN-VLSD-XXXXXXXX-EL",
+        min_length=15,
+        max_length=40
     )
 
-@tree.command(name="resetbinding", description="Unbind a Roblox UserId so it can register a new key")
-@app_commands.describe(roblox_user_id="The Roblox account UserId to unbind")
-async def resetbinding(interaction: discord.Interaction, roblox_user_id: str):
-    if not is_admin(interaction):
-        await interaction.response.send_message("You are not authorized.", ephemeral=True)
-        return
-    try:
-        uid = int(roblox_user_id)
-    except ValueError:
-        await interaction.response.send_message("Enter a numeric Roblox UserId.", ephemeral=True)
-        return
-    old_key = bindings.pop(uid, None)
-    if old_key and old_key in keys:
-        keys[old_key]["roblox_user_id"] = None
-    await interaction.response.send_message(
-        f"Binding reset for Roblox UserId `{uid}`. No IP address or hardware ID was collected.",
-        ephemeral=True
+    async def on_submit(self, interaction: discord.Interaction):
+        submitted = str(self.key.value).strip().upper()
+
+        with db() as con:
+            row = con.execute(
+                "SELECT * FROM keys WHERE key = ?",
+                (submitted,)
+            ).fetchone()
+
+            if row is None:
+                await interaction.response.send_message(
+                    "Invalid Aerin key.",
+                    ephemeral=True
+                )
+                return
+
+            if row["redeemed_by"] is not None:
+                message = (
+                    "You already redeemed this key."
+                    if row["redeemed_by"] == str(interaction.user.id)
+                    else "This key has already been used."
+                )
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=True
+                )
+                return
+
+            con.execute(
+                """UPDATE keys
+                   SET redeemed_by = ?, redeemed_at = CURRENT_TIMESTAMP
+                   WHERE key = ? AND redeemed_by IS NULL""",
+                (str(interaction.user.id), submitted)
+            )
+
+        await interaction.response.send_message(
+            "Your Aerin key has been redeemed successfully.",
+            ephemeral=True
+        )
+
+
+# ---------------- PANEL BUTTONS ----------------
+
+class AerinPanel(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Redeem Key",
+        style=discord.ButtonStyle.primary,
+        custom_id="aerin:redeem"
     )
+    async def redeem(self, interaction, button):
+        await interaction.response.send_modal(RedeemModal())
 
-@tree.command(name="revoke", description="Revoke a registration key")
-@app_commands.describe(key="The exact key to revoke")
-async def revoke(interaction: discord.Interaction, key: str):
-    if not is_admin(interaction):
-        await interaction.response.send_message("You are not authorized.", ephemeral=True)
-        return
-    record = keys.get(key)
-    if not record:
-        await interaction.response.send_message("Key not found.", ephemeral=True)
-        return
-    record["active"] = False
-    uid = record["roblox_user_id"]
-    if uid is not None:
-        bindings.pop(uid, None)
-    await interaction.response.send_message("Key revoked.", ephemeral=True)
+    @discord.ui.button(
+        label="Get Script",
+        style=discord.ButtonStyle.secondary,
+        custom_id="aerin:script"
+    )
+    async def get_script(self, interaction, button):
+        if not is_verified(interaction.user.id):
+            await interaction.response.send_message(
+                "Redeem your Aerin key first.",
+                ephemeral=True
+            )
+            return
 
-@client.event
+        if not SCRIPT_URL:
+            await interaction.response.send_message(
+                "The Aerin script URL has not been configured.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Your Aerin script link:\n{SCRIPT_URL}",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Get Role",
+        style=discord.ButtonStyle.success,
+        custom_id="aerin:role"
+    )
+    async def get_role(self, interaction, button):
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "Use this button in the server.",
+                ephemeral=True
+            )
+            return
+
+        if not is_verified(interaction.user.id):
+            await interaction.response.send_message(
+                "Redeem your Aerin key first.",
+                ephemeral=True
+            )
+            return
+
+        role = interaction.guild.get_role(VERIFIED_ROLE_ID)
+        member = interaction.guild.get_member(interaction.user.id)
+
+        if not role or not member:
+            await interaction.response.send_message(
+                "The verified role is not configured correctly.",
+                ephemeral=True
+            )
+            return
+
+        if role in member.roles:
+            await interaction.response.send_message(
+                "You already have the Aerin role.",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await member.add_roles(role, reason="Aerin key redeemed")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I cannot assign that role. Check my role permissions and hierarchy.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "Your Aerin role has been assigned.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Reset HWID",
+        style=discord.ButtonStyle.danger,
+        custom_id="aerin:reset_hwid"
+    )
+    async def reset_hwid(self, interaction, button):
+        if not is_verified(interaction.user.id):
+            await interaction.response.send_message(
+                "Redeem your Aerin key first.",
+                ephemeral=True
+            )
+            return
+
+        with db() as con:
+            con.execute(
+                """INSERT INTO members(discord_id, hwid)
+                   VALUES(?, NULL)
+                   ON CONFLICT(discord_id)
+                   DO UPDATE SET hwid = NULL""",
+                (str(interaction.user.id),)
+            )
+
+        await interaction.response.send_message(
+            "Your saved Aerin HWID field has been cleared.",
+            ephemeral=True
+        )
+
+
+# ---------------- BOT ----------------
+
+class AerinBot(commands.Bot):
+
+    def __init__(self):
+        super().__init__(
+            command_prefix="!",
+            intents=intents
+        )
+
+    async def setup_hook(self):
+        setup_database()
+        self.add_view(AerinPanel())
+
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+        else:
+            await self.tree.sync()
+
+
+bot = AerinBot()
+
+
+@bot.event
 async def on_ready():
-    await tree.sync()
-    print(f"Bot online as {client.user}")
+    log.info("Aerin online as %s", bot.user)
+
+
+# ---------------- PANEL COMMAND ----------------
+
+@bot.tree.command(
+    name="panel",
+    description="Post the Aerin panel"
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+async def panel(interaction: discord.Interaction):
+
+    embed = discord.Embed(
+        title="aerin panel",
+        description=(
+            "Redeem your key to unlock Aerin access.\n"
+            "Use the buttons below to manage your access."
+        ),
+        color=discord.Color.from_rgb(242, 190, 207)
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=AerinPanel()
+    )
+
+
+# ---------------- KEY GENERATOR ----------------
+
+@bot.tree.command(
+    name="generatekey",
+    description="Generate Aerin redemption keys"
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(amount="Number of keys to generate (1-25)")
+async def generatekey(
+    interaction: discord.Interaction,
+    amount: app_commands.Range[int, 1, 25] = 1
+):
+
+    generated = []
+
+    with db() as con:
+        for _ in range(amount):
+            key = create_key()
+
+            while con.execute(
+                "SELECT 1 FROM keys WHERE key = ?",
+                (key,)
+            ).fetchone():
+                key = create_key()
+
+            con.execute(
+                "INSERT INTO keys(key) VALUES(?)",
+                (key,)
+            )
+            generated.append(key)
+
+    try:
+        await interaction.user.send(
+            "Your Aerin keys:\n" +
+            "\n".join(f"`{key}`" for key in generated)
+        )
+        await interaction.response.send_message(
+            f"Generated {len(generated)} key(s). Check your DMs.",
+            ephemeral=True
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I couldn't DM you. Enable server DMs and try again.",
+            ephemeral=True
+        )
+
+
+# ---------------- ERROR HANDLING ----------------
+
+@panel.error
+@generatekey.error
+async def command_error(interaction, error):
+
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "Only administrators can use this command."
+    else:
+        log.error("Command error: %s", error)
+        message = "Something went wrong. Check the bot logs."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise SystemExit("Set DISCORD_TOKEN in .env first.")
-    if not API_SECRET or API_SECRET == "replace_with_a_long_random_secret":
-        raise SystemExit("Set a strong API_SECRET in .env first.")
-    threading.Thread(target=run_api, daemon=True).start()
-    client.run(DISCORD_TOKEN)
+    bot.run(TOKEN)
