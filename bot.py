@@ -17,7 +17,7 @@ from discord.ext import commands
 
 
 # ============================================================
-# CONFIGURATION
+# AERIN CONFIGURATION
 # ============================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -45,9 +45,9 @@ log = logging.getLogger("aerin")
 # ============================================================
 
 def db_connect():
-    db = sqlite3.connect(DATABASE_PATH)
-    db.row_factory = sqlite3.Row
-    return db
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def init_database():
@@ -80,11 +80,9 @@ def init_database():
             )
 
         db.execute("""
-            CREATE TABLE IF NOT EXISTS keys (
-                key TEXT PRIMARY KEY,
-                redeemed_by TEXT,
-                redeemed_at TEXT
-            )
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_accounts_username_nocase
+            ON accounts(username COLLATE NOCASE)
         """)
 
         db.commit()
@@ -99,13 +97,22 @@ def make_key():
     return "AERIN-" + "-".join(groups)
 
 
-def hash_password(password, salt_hex=None):
-    salt = (
-        bytes.fromhex(salt_hex)
-        if salt_hex
-        else secrets.token_bytes(16)
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_ITERATIONS
     )
+    return salt.hex(), digest.hex()
 
+
+def verify_password(password, salt_hex, expected_hash):
+    if not salt_hex or not expected_hash:
+        return False
+
+    salt = bytes.fromhex(salt_hex)
     digest = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
@@ -113,15 +120,10 @@ def hash_password(password, salt_hex=None):
         PASSWORD_ITERATIONS
     )
 
-    return salt.hex(), digest.hex()
-
-
-def verify_password(password, salt, expected):
-    if not salt or not expected:
-        return False
-
-    _, actual = hash_password(password, salt)
-    return hmac.compare_digest(actual, expected)
+    return hmac.compare_digest(
+        digest.hex(),
+        expected_hash
+    )
 
 
 def get_account(discord_id):
@@ -202,9 +204,15 @@ def register_account(discord_id, username, nickname, password):
         else:
             db.execute(
                 """
-                INSERT INTO accounts
-                (discord_id, username, nickname, user_key,
-                 created_at, password_salt, password_hash)
+                INSERT INTO accounts (
+                    discord_id,
+                    username,
+                    nickname,
+                    user_key,
+                    created_at,
+                    password_salt,
+                    password_hash
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -223,7 +231,7 @@ def register_account(discord_id, username, nickname, password):
     return get_account(discord_id)
 
 
-def create_admin_account(discord_id, username, nickname):
+def create_admin_account(discord_id, nickname):
     now = datetime.now(timezone.utc).isoformat()
 
     with db_connect() as db:
@@ -236,21 +244,26 @@ def create_admin_account(discord_id, username, nickname):
             db.execute(
                 """
                 UPDATE accounts
-                SET username = ?, nickname = ?
+                SET nickname = ?
                 WHERE discord_id = ?
                 """,
-                (username, nickname, str(discord_id))
+                (nickname, str(discord_id))
             )
         else:
             db.execute(
                 """
-                INSERT INTO accounts
-                (discord_id, username, nickname, user_key, created_at)
+                INSERT INTO accounts (
+                    discord_id,
+                    username,
+                    nickname,
+                    user_key,
+                    created_at
+                )
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     str(discord_id),
-                    username,
+                    f"user_{discord_id}",
                     nickname,
                     make_key(),
                     now
@@ -288,7 +301,7 @@ def account_embed(account, title="Aerin account"):
     embed.add_field(
         name="Account status",
         value=(
-            "Registered"
+            "Ready"
             if account["password_hash"]
             else "Password setup required"
         ),
@@ -309,21 +322,24 @@ class RegisterModal(discord.ui.Modal, title="Register Aerin account"):
         label="Username",
         placeholder="Choose your Aerin username",
         min_length=3,
-        max_length=24
+        max_length=24,
+        required=True
     )
 
     nickname = discord.ui.TextInput(
         label="Nickname",
         placeholder="Enter your nickname",
         min_length=2,
-        max_length=32
+        max_length=32,
+        required=True
     )
 
     password = discord.ui.TextInput(
         label="Password",
         placeholder="Create a unique Aerin password",
         min_length=10,
-        max_length=72
+        max_length=72,
+        required=True
     )
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -369,7 +385,7 @@ class RegisterModal(discord.ui.Modal, title="Register Aerin account"):
         )
 
         embed.description = (
-            "Your account has been registered successfully."
+            "Your Aerin account has been registered successfully."
         )
 
         await interaction.response.send_message(
@@ -456,44 +472,33 @@ class AerinPanel(discord.ui.View):
             )
             return
 
-        embed = discord.Embed(
-            title="Aerin resource",
-            description="Your Aerin account information.",
-            color=PINK
+        username = (
+            account["username"]
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
         )
 
-        embed.add_field(
-            name="Username",
-            value=account["username"],
-            inline=True
+        key = (
+            account["user_key"]
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
         )
 
-        embed.add_field(
-            name="Status",
-            value=(
-                "Ready"
-                if account["password_hash"]
-                else "Password setup required"
-            ),
-            inline=True
+        loader = (
+            "-- Aerin Main : -- /aerin Loader\n"
+            f'local USERNAME = "{username}"\n'
+            f'local KEY = "{key}"\n'
+            f'local URL = "{PUBLIC_URL}/load/aerin"\n'
+            'local HttpService = game:GetService("HttpService")\n'
+            "\n"
+            'print("[/aerin] Aerin account details loaded.")\n'
+            'print("[/aerin] Username:", USERNAME)\n'
+            'print("[/aerin] Verification endpoint:", URL)\n'
+            'print("[/aerin] Keep your key private.")'
         )
-
-        embed.add_field(
-            name="Endpoint",
-            value=f"`{PUBLIC_URL}/load/aerin`",
-            inline=False
-        )
-
-        embed.add_field(
-            name="Request",
-            value="POST JSON with `username` and `password`",
-            inline=False
-        )
-
-        embed.set_footer(text="Aerin account system")
 
         await interaction.response.send_message(
-            embed=embed,
+            content=f"```lua\n{loader}\n```",
             ephemeral=True
         )
 
@@ -558,8 +563,8 @@ async def panel(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Aerin",
         description=(
-            "Register your account, retrieve your key, "
-            "or view the Aerin account endpoint."
+            "Register your Aerin username and password, "
+            "retrieve your key, or get your copyable Lua snippet."
         ),
         color=PINK
     )
@@ -574,7 +579,7 @@ async def panel(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="generatekey",
-    description="Create an Aerin account for a server member."
+    description="Create an Aerin account record for a member."
 )
 @app_commands.describe(
     member="The Discord member",
@@ -599,7 +604,6 @@ async def generatekey(
     try:
         account = create_admin_account(
             member.id,
-            member.name,
             nickname
         )
 
@@ -611,7 +615,10 @@ async def generatekey(
         )
         return
 
-    embed = account_embed(account, "Aerin account created")
+    embed = account_embed(
+        account,
+        "Aerin account created"
+    )
 
     embed.add_field(
         name="Key",
@@ -714,7 +721,7 @@ async def load_aerin(request):
             "method": "POST",
             "required_fields": ["username", "password"],
             "status": "online",
-            "note": "Account verification endpoint."
+            "note": "Aerin account verification endpoint."
         })
 
     account, error = await authenticate_request(request)
