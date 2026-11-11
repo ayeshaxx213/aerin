@@ -12,9 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 
-# ============================================================
 # CONFIGURATION
-# ============================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
@@ -30,13 +28,10 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("aerin")
-
 intents = discord.Intents.default()
 
 
-# ============================================================
 # DATABASE
-# ============================================================
 
 def db():
     con = sqlite3.connect(DATABASE, timeout=20)
@@ -77,7 +72,6 @@ def make_key():
 def make_unique_key(con):
     while True:
         key = make_key()
-
         exists = con.execute(
             "SELECT 1 FROM accounts WHERE user_key = ?",
             (key,),
@@ -142,9 +136,7 @@ def register_account(user, nickname=None):
         return account, True
 
 
-# ============================================================
 # AERIN API
-# ============================================================
 
 async def health(request):
     return web.json_response({
@@ -170,19 +162,13 @@ async def verify_account(request):
         payload = await request.json()
     except (ValueError, TypeError):
         return web.json_response(
-            {
-                "success": False,
-                "reason": "Invalid JSON request",
-            },
+            {"success": False, "reason": "Invalid JSON request"},
             status=400,
         )
 
     if not isinstance(payload, dict):
         return web.json_response(
-            {
-                "success": False,
-                "reason": "Invalid request body",
-            },
+            {"success": False, "reason": "Invalid request body"},
             status=400,
         )
 
@@ -191,10 +177,7 @@ async def verify_account(request):
 
     if not isinstance(username, str) or not isinstance(key, str):
         return web.json_response(
-            {
-                "success": False,
-                "reason": "Username and key are required",
-            },
+            {"success": False, "reason": "Username and key are required"},
             status=400,
         )
 
@@ -208,10 +191,7 @@ async def verify_account(request):
         or len(key) > 64
     ):
         return web.json_response(
-            {
-                "success": False,
-                "reason": "Invalid username or key",
-            },
+            {"success": False, "reason": "Invalid username or key"},
             status=400,
         )
 
@@ -242,18 +222,14 @@ async def verify_account(request):
 
 def create_api_app():
     app = web.Application(client_max_size=16 * 1024)
-
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_get("/load/aerin", load_info)
     app.router.add_post("/verify", verify_account)
-
     return app
 
 
-# ============================================================
 # REGISTER MODAL
-# ============================================================
 
 class RegisterModal(discord.ui.Modal, title="Register for Aerin"):
 
@@ -286,9 +262,7 @@ class RegisterModal(discord.ui.Modal, title="Register for Aerin"):
         )
 
 
-# ============================================================
 # AERIN PANEL
-# ============================================================
 
 class AerinPanel(discord.ui.View):
 
@@ -328,7 +302,7 @@ class AerinPanel(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Get Script",
+        label="Account Status",
         style=discord.ButtonStyle.secondary,
         custom_id="aerin:getscript",
     )
@@ -342,22 +316,38 @@ class AerinPanel(discord.ui.View):
             )
             return
 
-        account_info = (
-            "-- Aerin account information\n"
-            f'local USERNAME = "{account["username"]}"\n'
-            f'local KEY = "{account["user_key"]}"\n'
-            'print("Aerin account information loaded for " .. USERNAME)\n'
+        embed = discord.Embed(
+            title="Aerin account verified",
+            description=(
+                "Your Aerin account has been successfully verified."
+            ),
+            color=discord.Color.from_rgb(242, 190, 207),
         )
 
+        embed.add_field(
+            name="Username",
+            value=account["username"],
+            inline=True,
+        )
+        embed.add_field(
+            name="Nickname",
+            value=account["nickname"] or "Not set",
+            inline=True,
+        )
+        embed.add_field(
+            name="Account status",
+            value="Verified",
+            inline=False,
+        )
+        embed.set_footer(text="Aerin account system")
+
         await interaction.response.send_message(
-            f"```lua\n{account_info}```",
+            embed=embed,
             ephemeral=True,
         )
 
 
-# ============================================================
 # BOT
-# ============================================================
 
 class AerinBot(commands.Bot):
 
@@ -383,9 +373,6 @@ class AerinBot(commands.Bot):
         except discord.HTTPException:
             log.exception("Could not sync application commands")
 
-    async def close(self):
-        await super().close()
-
 
 bot = AerinBot()
 
@@ -395,9 +382,7 @@ async def on_ready():
     log.info("Aerin online as %s", bot.user)
 
 
-# ============================================================
 # /PANEL
-# ============================================================
 
 @bot.tree.command(
     name="panel",
@@ -410,7 +395,8 @@ async def panel(interaction: discord.Interaction):
     embed = discord.Embed(
         title="aerin panel",
         description=(
-            "Register your Aerin account and manage your account details.\n"
+            "Register your Aerin account, view your key, "
+            "and check your account status.\n"
             "Choose an option below to continue."
         ),
         color=discord.Color.from_rgb(242, 190, 207),
@@ -424,9 +410,7 @@ async def panel(interaction: discord.Interaction):
     )
 
 
-# ============================================================
 # /GENERATEKEY
-# ============================================================
 
 @bot.tree.command(
     name="generatekey",
@@ -484,9 +468,7 @@ async def generatekey(
     )
 
 
-# ============================================================
 # COMMAND ERROR HANDLING
-# ============================================================
 
 @panel.error
 @generatekey.error
@@ -518,9 +500,7 @@ async def command_error(interaction, error):
         log.exception("Could not send error response")
 
 
-# ============================================================
 # START API BEFORE DISCORD LOGIN
-# ============================================================
 
 async def start_api():
     setup_database()
@@ -539,7 +519,6 @@ async def start_api():
     await site.start()
 
     log.info("Aerin API listening on port %s", PORT)
-
     return runner
 
 
