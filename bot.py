@@ -21,6 +21,9 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
 PORT = int(os.getenv("PORT", "10000"))
 DATABASE = os.getenv("DATABASE_PATH", "aerin.sqlite3")
 
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -29,7 +32,6 @@ logging.basicConfig(
 log = logging.getLogger("aerin")
 
 intents = discord.Intents.default()
-intents.members = True
 
 
 # ============================================================
@@ -66,7 +68,6 @@ def setup_database():
 def make_key():
     alphabet = string.ascii_uppercase + string.digits
     value = "".join(secrets.choice(alphabet) for _ in range(16))
-
     return (
         f"AERIN-{value[:4]}-{value[4:8]}-"
         f"{value[8:12]}-{value[12:]}"
@@ -150,30 +151,24 @@ async def health(request):
         "success": True,
         "service": "Aerin",
         "status": "online",
-    })
-
-
-async def load_aerin_info(request):
-    """
-    Public information endpoint.
-
-    This route does not distribute or execute protected
-    Roblox scripts.
-    """
-    return web.json_response({
-        "success": True,
-        "service": "Aerin",
-        "status": "online",
         "message": "Aerin API is running.",
         "verification_endpoint": "/verify",
         "method": "POST",
     })
 
 
+async def load_info(request):
+    return web.json_response({
+        "success": True,
+        "service": "Aerin",
+        "status": "online",
+    })
+
+
 async def verify_account(request):
     try:
         payload = await request.json()
-    except Exception:
+    except (ValueError, TypeError):
         return web.json_response(
             {
                 "success": False,
@@ -186,7 +181,7 @@ async def verify_account(request):
         return web.json_response(
             {
                 "success": False,
-                "reason": "Invalid request data",
+                "reason": "Invalid request body",
             },
             status=400,
         )
@@ -250,12 +245,7 @@ def create_api_app():
 
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-
-    # Aerin route
-    app.router.add_get("/load/aerin", load_aerin_info)
-    app.router.add_post("/load/aerin", verify_account)
-
-    # Standard verification route
+    app.router.add_get("/load/aerin", load_info)
     app.router.add_post("/verify", verify_account)
 
     return app
@@ -355,9 +345,8 @@ class AerinPanel(discord.ui.View):
         account_info = (
             "-- Aerin account information\n"
             f'local USERNAME = "{account["username"]}"\n'
-            f'local NICKNAME = "{account["nickname"]}"\n'
             f'local KEY = "{account["user_key"]}"\n'
-            'print("Aerin account registered for " .. USERNAME)\n'
+            'print("Aerin account information loaded for " .. USERNAME)\n'
         )
 
         await interaction.response.send_message(
@@ -385,30 +374,25 @@ class AerinBot(commands.Bot):
             if GUILD_ID:
                 guild = discord.Object(id=GUILD_ID)
                 self.tree.copy_global_to(guild=guild)
-
                 synced = await self.tree.sync(guild=guild)
-                log.info(
-                    "Synced %s guild commands",
-                    len(synced),
-                )
             else:
                 synced = await self.tree.sync()
-                log.info(
-                    "Synced %s global commands",
-                    len(synced),
-                )
+
+            log.info("Synced %s application commands", len(synced))
 
         except discord.HTTPException:
-            log.exception(
-                "Discord command sync failed. "
-                "The Aerin API will remain available."
-            )
+            log.exception("Could not sync application commands")
 
-    async def on_ready(self):
-        log.info("Aerin online as %s", self.user)
+    async def close(self):
+        await super().close()
 
 
 bot = AerinBot()
+
+
+@bot.event
+async def on_ready():
+    log.info("Aerin online as %s", bot.user)
 
 
 # ============================================================
@@ -510,10 +494,8 @@ async def command_error(interaction, error):
 
     if isinstance(error, app_commands.MissingPermissions):
         message = "Only administrators can use this command."
-
     elif isinstance(error, app_commands.CheckFailure):
         message = "You do not have permission to use this command."
-
     else:
         log.error(
             "Command failed",
@@ -532,13 +514,12 @@ async def command_error(interaction, error):
                 message,
                 ephemeral=True,
             )
-
     except discord.HTTPException:
         log.exception("Could not send error response")
 
 
 # ============================================================
-# START API INDEPENDENTLY FROM DISCORD
+# START API BEFORE DISCORD LOGIN
 # ============================================================
 
 async def start_api():
@@ -562,59 +543,39 @@ async def start_api():
     return runner
 
 
-async def start_discord():
-    if not TOKEN:
-        log.error(
-            "DISCORD_TOKEN is missing. "
-            "The API will continue running without Discord."
-        )
-        return
-
-    try:
-        log.info("Starting Aerin Discord bot...")
-        await bot.start(TOKEN)
-
-    except discord.HTTPException as error:
-        log.error(
-            "Discord login failed with HTTP status %s. "
-            "The API will remain online. "
-            "Do not repeatedly restart the service.",
-            error.status,
-        )
-
-    except discord.LoginFailure:
-        log.exception(
-            "Discord rejected the bot token. "
-            "Check DISCORD_TOKEN in Render."
-        )
-
-    except Exception:
-        log.exception(
-            "Discord connection failed. "
-            "The API will remain online."
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
 async def main():
     runner = await start_api()
 
-    try:
-        await start_discord()
+    log.info("Starting Aerin Discord bot...")
 
-        # Keep the API alive if Discord login fails or exits.
-        log.info("Aerin API remains active.")
+    try:
+        await bot.start(TOKEN)
+
+    except discord.HTTPException as error:
+        if error.status == 429:
+            log.error(
+                "Discord returned HTTP 429. "
+                "No automatic login retries will be made. "
+                "The Aerin API will remain online."
+            )
+        else:
+            log.exception(
+                "Discord HTTP error during startup: %s",
+                error.status,
+            )
 
         await asyncio.Event().wait()
 
-    finally:
-        await runner.cleanup()
+    except discord.LoginFailure:
+        log.exception(
+            "Discord rejected the configured bot token. "
+            "Check the DISCORD_TOKEN environment variable."
+        )
+        await asyncio.Event().wait()
 
-        if not bot.is_closed():
-            await bot.close()
+    finally:
+        await bot.close()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
