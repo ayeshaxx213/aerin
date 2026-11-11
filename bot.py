@@ -6,7 +6,6 @@ import secrets
 import sqlite3
 import string
 
-import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -21,9 +20,6 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
 PORT = int(os.getenv("PORT", "10000"))
 DATABASE = os.getenv("DATABASE_PATH", "aerin.sqlite3")
-
-if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +66,11 @@ def setup_database():
 def make_key():
     alphabet = string.ascii_uppercase + string.digits
     value = "".join(secrets.choice(alphabet) for _ in range(16))
-    return f"AERIN-{value[:4]}-{value[4:8]}-{value[8:12]}-{value[12:]}"
+
+    return (
+        f"AERIN-{value[:4]}-{value[4:8]}-"
+        f"{value[8:12]}-{value[12:]}"
+    )
 
 
 def make_unique_key(con):
@@ -95,7 +95,9 @@ def get_account(discord_id):
 
 
 def register_account(user, nickname=None):
-    display_name = nickname or getattr(user, "display_name", user.name)
+    display_name = nickname or getattr(
+        user, "display_name", user.name
+    )
 
     with db() as con:
         existing = con.execute(
@@ -113,10 +115,12 @@ def register_account(user, nickname=None):
                 (user.name, display_name, str(user.id)),
             )
 
-            return con.execute(
+            account = con.execute(
                 "SELECT * FROM accounts WHERE discord_id = ?",
                 (str(user.id),),
-            ).fetchone(), False
+            ).fetchone()
+
+            return account, False
 
         key = make_unique_key(con)
 
@@ -129,10 +133,12 @@ def register_account(user, nickname=None):
             (str(user.id), user.name, display_name, key),
         )
 
-        return con.execute(
+        account = con.execute(
             "SELECT * FROM accounts WHERE discord_id = ?",
             (str(user.id),),
-        ).fetchone(), True
+        ).fetchone()
+
+        return account, True
 
 
 # ============================================================
@@ -147,14 +153,40 @@ async def health(request):
     })
 
 
+async def load_aerin_info(request):
+    """
+    Public information endpoint.
+
+    This route does not distribute or execute protected
+    Roblox scripts.
+    """
+    return web.json_response({
+        "success": True,
+        "service": "Aerin",
+        "status": "online",
+        "message": "Aerin API is running.",
+        "verification_endpoint": "/verify",
+        "method": "POST",
+    })
+
+
 async def verify_account(request):
     try:
         payload = await request.json()
-    except (ValueError, Exception):
+    except Exception:
         return web.json_response(
             {
                 "success": False,
                 "reason": "Invalid JSON request",
+            },
+            status=400,
+        )
+
+    if not isinstance(payload, dict):
+        return web.json_response(
+            {
+                "success": False,
+                "reason": "Invalid request data",
             },
             status=400,
         )
@@ -174,7 +206,12 @@ async def verify_account(request):
     username = username.strip()
     key = key.strip()
 
-    if not username or not key or len(username) > 64 or len(key) > 64:
+    if (
+        not username
+        or not key
+        or len(username) > 64
+        or len(key) > 64
+    ):
         return web.json_response(
             {
                 "success": False,
@@ -213,6 +250,12 @@ def create_api_app():
 
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+
+    # Aerin route
+    app.router.add_get("/load/aerin", load_aerin_info)
+    app.router.add_post("/load/aerin", verify_account)
+
+    # Standard verification route
     app.router.add_post("/verify", verify_account)
 
     return app
@@ -312,8 +355,9 @@ class AerinPanel(discord.ui.View):
         account_info = (
             "-- Aerin account information\n"
             f'local USERNAME = "{account["username"]}"\n'
+            f'local NICKNAME = "{account["nickname"]}"\n'
             f'local KEY = "{account["user_key"]}"\n'
-            'print("Aerin account information loaded for " .. USERNAME)\n'
+            'print("Aerin account registered for " .. USERNAME)\n'
         )
 
         await interaction.response.send_message(
@@ -323,7 +367,7 @@ class AerinPanel(discord.ui.View):
 
 
 # ============================================================
-# BOT AND WEB SERVER
+# BOT
 # ============================================================
 
 class AerinBot(commands.Bot):
@@ -333,53 +377,38 @@ class AerinBot(commands.Bot):
             command_prefix="!",
             intents=intents,
         )
-        self.api_runner = None
 
     async def setup_hook(self):
-        setup_database()
-
         self.add_view(AerinPanel())
 
-        # Start the API server on the same Render service.
-        app = create_api_app()
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=guild)
 
-        self.api_runner = web.AppRunner(app)
-        await self.api_runner.setup()
+                synced = await self.tree.sync(guild=guild)
+                log.info(
+                    "Synced %s guild commands",
+                    len(synced),
+                )
+            else:
+                synced = await self.tree.sync()
+                log.info(
+                    "Synced %s global commands",
+                    len(synced),
+                )
 
-        site = web.TCPSite(
-            self.api_runner,
-            "0.0.0.0",
-            PORT,
-        )
+        except discord.HTTPException:
+            log.exception(
+                "Discord command sync failed. "
+                "The Aerin API will remain available."
+            )
 
-        await site.start()
-
-        log.info("Aerin API listening on port %s", PORT)
-
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-
-            synced = await self.tree.sync(guild=guild)
-
-            log.info("Synced %s guild commands", len(synced))
-        else:
-            synced = await self.tree.sync()
-            log.info("Synced %s global commands", len(synced))
-
-    async def close(self):
-        if self.api_runner:
-            await self.api_runner.cleanup()
-
-        await super().close()
+    async def on_ready(self):
+        log.info("Aerin online as %s", self.user)
 
 
 bot = AerinBot()
-
-
-@bot.event
-async def on_ready():
-    log.info("Aerin online as %s", bot.user)
 
 
 # ============================================================
@@ -459,7 +488,11 @@ async def generatekey(
             "They can use Get Key in the panel."
         )
 
-    status = "Created a new account." if created else "Updated the account."
+    status = (
+        "Created a new account."
+        if created
+        else "Updated the account."
+    )
 
     await interaction.followup.send(
         f"{status} {dm_message}",
@@ -468,7 +501,7 @@ async def generatekey(
 
 
 # ============================================================
-# ERROR HANDLING
+# COMMAND ERROR HANDLING
 # ============================================================
 
 @panel.error
@@ -477,8 +510,10 @@ async def command_error(interaction, error):
 
     if isinstance(error, app_commands.MissingPermissions):
         message = "Only administrators can use this command."
+
     elif isinstance(error, app_commands.CheckFailure):
         message = "You do not have permission to use this command."
+
     else:
         log.error(
             "Command failed",
@@ -488,16 +523,102 @@ async def command_error(interaction, error):
 
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+            )
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
+
     except discord.HTTPException:
         log.exception("Could not send error response")
 
 
 # ============================================================
-# START
+# START API INDEPENDENTLY FROM DISCORD
 # ============================================================
 
+async def start_api():
+    setup_database()
+
+    app = create_api_app()
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT,
+    )
+
+    await site.start()
+
+    log.info("Aerin API listening on port %s", PORT)
+
+    return runner
+
+
+async def start_discord():
+    if not TOKEN:
+        log.error(
+            "DISCORD_TOKEN is missing. "
+            "The API will continue running without Discord."
+        )
+        return
+
+    try:
+        log.info("Starting Aerin Discord bot...")
+        await bot.start(TOKEN)
+
+    except discord.HTTPException as error:
+        log.error(
+            "Discord login failed with HTTP status %s. "
+            "The API will remain online. "
+            "Do not repeatedly restart the service.",
+            error.status,
+        )
+
+    except discord.LoginFailure:
+        log.exception(
+            "Discord rejected the bot token. "
+            "Check DISCORD_TOKEN in Render."
+        )
+
+    except Exception:
+        log.exception(
+            "Discord connection failed. "
+            "The API will remain online."
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+    runner = await start_api()
+
+    try:
+        await start_discord()
+
+        # Keep the API alive if Discord login fails or exits.
+        log.info("Aerin API remains active.")
+
+        await asyncio.Event().wait()
+
+    finally:
+        await runner.cleanup()
+
+        if not bot.is_closed():
+            await bot.close()
+
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Aerin shutting down.")
