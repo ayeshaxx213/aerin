@@ -1,10 +1,12 @@
 
 import asyncio
+import json
 import logging
 import os
 import secrets
 import sqlite3
 import string
+from datetime import datetime, timezone
 
 import discord
 from aiohttp import web
@@ -12,240 +14,167 @@ from discord import app_commands
 from discord.ext import commands
 
 
-# CONFIGURATION
+# ============================================================
+# AERIN CONFIGURATION
+# ============================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
-PORT = int(os.getenv("PORT", "10000"))
-DATABASE = os.getenv("DATABASE_PATH", "aerin.sqlite3")
+PORT = int(os.getenv("PORT", "10000") or "10000")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "aerin.sqlite3")
 
-if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
+PUBLIC_URL = os.getenv(
+    "AERIN_PUBLIC_URL",
+    "https://aerin-2.onrender.com"
+).rstrip("/")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-
 log = logging.getLogger("aerin")
-intents = discord.Intents.default()
 
 
+# ============================================================
 # DATABASE
+# ============================================================
 
-def db():
-    con = sqlite3.connect(DATABASE, timeout=20)
-    con.row_factory = sqlite3.Row
-    return con
+def db_connect():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
-def setup_database():
-    with db() as con:
-        con.execute("""
+def init_database():
+    with db_connect() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                discord_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                nickname TEXT NOT NULL,
+                user_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.execute("""
             CREATE TABLE IF NOT EXISTS keys (
                 key TEXT PRIMARY KEY,
                 redeemed_by TEXT,
                 redeemed_at TEXT
             )
         """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                discord_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                nickname TEXT NOT NULL DEFAULT '',
-                user_key TEXT UNIQUE NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        db.commit()
 
 
 def make_key():
     alphabet = string.ascii_uppercase + string.digits
-    value = "".join(secrets.choice(alphabet) for _ in range(16))
-    return (
-        f"AERIN-{value[:4]}-{value[4:8]}-"
-        f"{value[8:12]}-{value[12:]}"
-    )
-
-
-def make_unique_key(con):
-    while True:
-        key = make_key()
-        exists = con.execute(
-            "SELECT 1 FROM accounts WHERE user_key = ?",
-            (key,),
-        ).fetchone()
-
-        if not exists:
-            return key
+    groups = [
+        "".join(secrets.choice(alphabet) for _ in range(4))
+        for _ in range(4)
+    ]
+    return "AERIN-" + "-".join(groups)
 
 
 def get_account(discord_id):
-    with db() as con:
-        return con.execute(
+    with db_connect() as db:
+        return db.execute(
             "SELECT * FROM accounts WHERE discord_id = ?",
-            (str(discord_id),),
+            (str(discord_id),)
         ).fetchone()
 
 
-def register_account(user, nickname=None):
-    display_name = nickname or getattr(
-        user, "display_name", user.name
-    )
-
-    with db() as con:
-        existing = con.execute(
-            "SELECT * FROM accounts WHERE discord_id = ?",
-            (str(user.id),),
+def get_account_by_credentials(username, key):
+    with db_connect() as db:
+        return db.execute(
+            """
+            SELECT * FROM accounts
+            WHERE lower(username) = lower(?) AND user_key = ?
+            """,
+            (username.strip(), key.strip())
         ).fetchone()
 
-        if existing:
-            con.execute(
+
+def create_or_update_account(discord_id, username, nickname):
+    existing = get_account(discord_id)
+    now = datetime.now(timezone.utc).isoformat()
+
+    if existing:
+        with db_connect() as db:
+            db.execute(
                 """
                 UPDATE accounts
                 SET username = ?, nickname = ?
                 WHERE discord_id = ?
                 """,
-                (user.name, display_name, str(user.id)),
+                (username, nickname, str(discord_id))
             )
+            db.commit()
+        return get_account(discord_id), False
 
-            account = con.execute(
-                "SELECT * FROM accounts WHERE discord_id = ?",
-                (str(user.id),),
-            ).fetchone()
-
-            return account, False
-
-        key = make_unique_key(con)
-
-        con.execute(
+    key = make_key()
+    with db_connect() as db:
+        db.execute(
             """
             INSERT INTO accounts
-            (discord_id, username, nickname, user_key)
-            VALUES (?, ?, ?, ?)
+            (discord_id, username, nickname, user_key, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (str(user.id), user.name, display_name, key),
+            (str(discord_id), username, nickname, key, now)
         )
+        db.commit()
 
-        account = con.execute(
-            "SELECT * FROM accounts WHERE discord_id = ?",
-            (str(user.id),),
-        ).fetchone()
-
-        return account, True
+    return get_account(discord_id), True
 
 
-# AERIN API
+# ============================================================
+# DISCORD EMBEDS
+# ============================================================
 
-async def health(request):
-    return web.json_response({
-        "success": True,
-        "service": "Aerin",
-        "status": "online",
-        "message": "Aerin API is running.",
-        "verification_endpoint": "/verify",
-        "method": "POST",
-    })
+PINK = discord.Color.from_rgb(245, 174, 204)
 
 
-async def load_info(request):
-    return web.json_response({
-        "success": True,
-        "service": "Aerin",
-        "status": "online",
-    })
+def account_embed(account, title="Aerin account"):
+    embed = discord.Embed(
+        title=title,
+        color=PINK,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Username", value=account["username"], inline=True)
+    embed.add_field(name="Nickname", value=account["nickname"], inline=True)
+    embed.add_field(name="Account status", value="Registered", inline=False)
+    embed.set_footer(text="Aerin account system")
+    return embed
 
 
-async def verify_account(request):
-    try:
-        payload = await request.json()
-    except (ValueError, TypeError):
-        return web.json_response(
-            {"success": False, "reason": "Invalid JSON request"},
-            status=400,
-        )
-
-    if not isinstance(payload, dict):
-        return web.json_response(
-            {"success": False, "reason": "Invalid request body"},
-            status=400,
-        )
-
-    username = payload.get("username")
-    key = payload.get("key")
-
-    if not isinstance(username, str) or not isinstance(key, str):
-        return web.json_response(
-            {"success": False, "reason": "Username and key are required"},
-            status=400,
-        )
-
-    username = username.strip()
-    key = key.strip()
-
-    if (
-        not username
-        or not key
-        or len(username) > 64
-        or len(key) > 64
-    ):
-        return web.json_response(
-            {"success": False, "reason": "Invalid username or key"},
-            status=400,
-        )
-
-    with db() as con:
-        account = con.execute(
-            """
-            SELECT username, nickname
-            FROM accounts
-            WHERE lower(username) = lower(?)
-            AND user_key = ?
-            """,
-            (username, key),
-        ).fetchone()
-
-    if account is None:
-        return web.json_response({
-            "success": False,
-            "reason": "Invalid username or key",
-        })
-
-    return web.json_response({
-        "success": True,
-        "username": account["username"],
-        "nickname": account["nickname"],
-        "message": "Aerin account verified",
-    })
-
-
-def create_api_app():
-    app = web.Application(client_max_size=16 * 1024)
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_get("/load/aerin", load_info)
-    app.router.add_post("/verify", verify_account)
-    return app
-
-
+# ============================================================
 # REGISTER MODAL
+# ============================================================
 
-class RegisterModal(discord.ui.Modal, title="Register for Aerin"):
-
+class RegisterModal(discord.ui.Modal, title="Register Aerin account"):
     nickname = discord.ui.TextInput(
         label="Nickname",
         placeholder="Enter your Aerin nickname",
-        min_length=1,
-        max_length=32,
-        required=True,
+        min_length=2,
+        max_length=32
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        account, created = register_account(
-            interaction.user,
-            str(self.nickname.value).strip(),
-        )
+        username = interaction.user.name
+        nickname = str(self.nickname.value).strip()
+
+        try:
+            account, created = create_or_update_account(
+                interaction.user.id,
+                username,
+                nickname
+            )
+        except sqlite3.Error:
+            log.exception("Could not save account")
+            await interaction.response.send_message(
+                "A database error occurred. Please try again later.",
+                ephemeral=True
+            )
+            return
 
         message = (
             "Your Aerin account has been created."
@@ -254,108 +183,132 @@ class RegisterModal(discord.ui.Modal, title="Register for Aerin"):
         )
 
         await interaction.response.send_message(
-            f"{message}\n"
-            f"Username: `{account['username']}`\n"
-            f"Nickname: `{account['nickname']}`\n"
-            "Use Get Key to view your account key.",
-            ephemeral=True,
+            content=message,
+            embed=account_embed(account),
+            ephemeral=True
         )
 
 
-# AERIN PANEL
+# ============================================================
+# PANEL BUTTONS
+# ============================================================
 
 class AerinPanel(discord.ui.View):
-
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(
         label="Register",
-        style=discord.ButtonStyle.primary,
-        custom_id="aerin:register",
+        style=discord.ButtonStyle.secondary,
+        custom_id="aerin:register"
     )
-    async def register(self, interaction, button):
+    async def register_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
         await interaction.response.send_modal(RegisterModal())
 
     @discord.ui.button(
         label="Get Key",
-        style=discord.ButtonStyle.success,
-        custom_id="aerin:getkey",
-    )
-    async def get_key(self, interaction, button):
-        account = get_account(interaction.user.id)
-
-        if account is None:
-            await interaction.response.send_message(
-                "Register your Aerin account first.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_message(
-            "**Your Aerin account**\n"
-            f"Username: `{account['username']}`\n"
-            f"Nickname: `{account['nickname']}`\n"
-            f"Key: `{account['user_key']}`\n\n"
-            "Keep your key private.",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(
-        label="Account Status",
         style=discord.ButtonStyle.secondary,
-        custom_id="aerin:getscript",
+        custom_id="aerin:getkey"
     )
-    async def get_script(self, interaction, button):
+    async def get_key_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
         account = get_account(interaction.user.id)
 
-        if account is None:
+        if not account:
             await interaction.response.send_message(
-                "Register your Aerin account first.",
-                ephemeral=True,
+                "You do not have an Aerin account yet. Press Register first.",
+                ephemeral=True
             )
             return
 
         embed = discord.Embed(
-            title="Aerin account verified",
-            description=(
-                "Your Aerin account has been successfully verified."
-            ),
-            color=discord.Color.from_rgb(242, 190, 207),
+            title="Your Aerin key",
+            description=f"```{account['user_key']}```",
+            color=PINK
         )
-
         embed.add_field(
             name="Username",
             value=account["username"],
-            inline=True,
+            inline=True
+        )
+        embed.set_footer(text="Keep your key private.")
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Get Script",
+        style=discord.ButtonStyle.primary,
+        custom_id="aerin:getscript"
+    )
+    async def get_script_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        account = get_account(interaction.user.id)
+
+        if not account:
+            await interaction.response.send_message(
+                "You do not have an Aerin account yet. Press Register first.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="Aerin resource",
+            description=(
+                "Your account is registered. Use the Aerin resource link "
+                "below to view the account service response."
+            ),
+            color=PINK
         )
         embed.add_field(
-            name="Nickname",
-            value=account["nickname"] or "Not set",
-            inline=True,
+            name="Username",
+            value=account["username"],
+            inline=True
         )
         embed.add_field(
-            name="Account status",
+            name="Status",
             value="Verified",
-            inline=False,
+            inline=True
+        )
+        embed.add_field(
+            name="Resource",
+            value=f"[Open Aerin resource]({PUBLIC_URL}/load/aerin)",
+            inline=False
         )
         embed.set_footer(text="Aerin account system")
 
         await interaction.response.send_message(
             embed=embed,
-            ephemeral=True,
+            ephemeral=True
         )
 
 
-# BOT
+# ============================================================
+# DISCORD BOT
+# ============================================================
+
+intents = discord.Intents.default()
+
 
 class AerinBot(commands.Bot):
-
     def __init__(self):
         super().__init__(
             command_prefix="!",
-            intents=intents,
+            intents=intents
         )
+        self.web_runner = None
 
     async def setup_hook(self):
         self.add_view(AerinPanel())
@@ -365,200 +318,221 @@ class AerinBot(commands.Bot):
                 guild = discord.Object(id=GUILD_ID)
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
+                log.info("Synced %s guild commands.", len(synced))
             else:
                 synced = await self.tree.sync()
-
-            log.info("Synced %s application commands", len(synced))
-
+                log.info("Synced %s global commands.", len(synced))
         except discord.HTTPException:
-            log.exception("Could not sync application commands")
+            log.exception("Could not sync application commands.")
+
+    async def on_ready(self):
+        log.info("Aerin Discord bot connected as %s", self.user)
+
+    async def close(self):
+        if self.web_runner:
+            await self.web_runner.cleanup()
+            self.web_runner = None
+        await super().close()
 
 
 bot = AerinBot()
 
 
-@bot.event
-async def on_ready():
-    log.info("Aerin online as %s", bot.user)
-
-
-# /PANEL
+# ============================================================
+# DISCORD SLASH COMMANDS
+# ============================================================
 
 @bot.tree.command(
     name="panel",
-    description="Post the Aerin account panel",
+    description="Post the Aerin account panel."
 )
-@app_commands.guild_only()
 @app_commands.checks.has_permissions(administrator=True)
 async def panel(interaction: discord.Interaction):
-
     embed = discord.Embed(
-        title="aerin panel",
+        title="Aerin",
         description=(
-            "Register your Aerin account, view your key, "
-            "and check your account status.\n"
-            "Choose an option below to continue."
+            "Register your account, retrieve your key, "
+            "or open the Aerin resource."
         ),
-        color=discord.Color.from_rgb(242, 190, 207),
+        color=PINK
     )
-
-    embed.set_footer(text="Aerin account panel")
+    embed.set_footer(text="Aerin account system")
 
     await interaction.response.send_message(
         embed=embed,
-        view=AerinPanel(),
+        view=AerinPanel()
     )
 
-
-# /GENERATEKEY
 
 @bot.tree.command(
     name="generatekey",
-    description="Generate an Aerin account for a member",
+    description="Create or update an Aerin account for a server member."
 )
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     member="The Discord member",
-    nickname="Optional Aerin nickname",
+    nickname="The Aerin nickname for this account"
 )
+@app_commands.checks.has_permissions(administrator=True)
 async def generatekey(
     interaction: discord.Interaction,
     member: discord.Member,
-    nickname: str = None,
+    nickname: str
 ):
+    nickname = nickname.strip()
 
-    if not interaction.user.guild_permissions.administrator:
+    if len(nickname) < 2 or len(nickname) > 32:
         await interaction.response.send_message(
-            "Only administrators can use this command.",
-            ephemeral=True,
+            "Nickname must be between 2 and 32 characters.",
+            ephemeral=True
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    try:
+        account, created = create_or_update_account(
+            member.id,
+            member.name,
+            nickname
+        )
+    except sqlite3.Error:
+        log.exception("Could not create account")
+        await interaction.response.send_message(
+            "A database error occurred.",
+            ephemeral=True
+        )
+        return
 
-    account, created = register_account(member, nickname)
+    status = "created" if created else "updated"
+    embed = account_embed(account, "Aerin key generated")
+    embed.add_field(
+        name="Key",
+        value=f"```{account['user_key']}```",
+        inline=False
+    )
 
     try:
-        await member.send(
-            "**Your Aerin account details**\n"
-            f"Username: `{account['username']}`\n"
-            f"Nickname: `{account['nickname']}`\n"
-            f"Key: `{account['user_key']}`\n\n"
-            "Keep your key private.",
-        )
-
-        dm_message = "The account details were sent to their DMs."
-
+        await member.send(embed=embed)
+        dm_status = "The account was created and its details were sent by DM."
     except discord.Forbidden:
-        dm_message = (
-            "I couldn't DM the member. "
+        dm_status = (
+            "The account was created, but I could not DM the member. "
             "They can use Get Key in the panel."
         )
 
-    status = (
-        "Created a new account."
-        if created
-        else "Updated the account."
-    )
-
-    await interaction.followup.send(
-        f"{status} {dm_message}",
-        ephemeral=True,
+    await interaction.response.send_message(
+        f"Account {status} for {member.mention}. {dm_status}",
+        ephemeral=True
     )
 
 
-# COMMAND ERROR HANDLING
+# ============================================================
+# API RESPONSE HELPERS
+# ============================================================
 
-@panel.error
-@generatekey.error
-async def command_error(interaction, error):
+def json_response(data, status=200):
+    return web.json_response(data, status=status)
 
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "Only administrators can use this command."
-    elif isinstance(error, app_commands.CheckFailure):
-        message = "You do not have permission to use this command."
-    else:
-        log.error(
-            "Command failed",
-            exc_info=(type(error), error, error.__traceback__),
-        )
-        message = "Something went wrong. Check Render logs."
 
+async def home(request):
+    return json_response({
+        "service": "Aerin",
+        "status": "online",
+        "message": "Aerin account API is running."
+    })
+
+
+async def health(request):
+    return json_response({
+        "service": "Aerin",
+        "status": "healthy"
+    })
+
+
+async def verify(request):
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                message,
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                message,
-                ephemeral=True,
-            )
-    except discord.HTTPException:
-        log.exception("Could not send error response")
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return json_response({
+            "success": False,
+            "reason": "Invalid JSON."
+        }, 400)
+
+    username = str(payload.get("username", "")).strip()
+    key = str(payload.get("key", "")).strip()
+
+    if not username or not key:
+        return json_response({
+            "success": False,
+            "reason": "Username and key are required."
+        }, 400)
+
+    account = get_account_by_credentials(username, key)
+
+    if not account:
+        return json_response({
+            "success": False,
+            "reason": "Invalid username or key."
+        }, 401)
+
+    return json_response({
+        "success": True,
+        "username": account["username"],
+        "nickname": account["nickname"],
+        "status": "verified"
+    })
 
 
-# START API BEFORE DISCORD LOGIN
+async def load_aerin(request):
+    # Returns account-service information only.
+    # Does not return executable code or an executor payload.
+    return json_response({
+        "success": True,
+        "service": "Aerin",
+        "status": "online",
+        "message": "Aerin resource endpoint is working.",
+        "verification_endpoint": f"{PUBLIC_URL}/verify"
+    })
+
+
+def create_web_app():
+    app = web.Application(client_max_size=16 * 1024)
+    app.router.add_get("/", home)
+    app.router.add_get("/health", health)
+    app.router.add_post("/verify", verify)
+    app.router.add_get("/load/aerin", load_aerin)
+    return app
+
 
 async def start_api():
-    setup_database()
-
-    app = create_api_app()
+    app = create_web_app()
     runner = web.AppRunner(app)
-
     await runner.setup()
 
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT,
-    )
-
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
+    bot.web_runner = runner
     log.info("Aerin API listening on port %s", PORT)
-    return runner
 
+
+# ============================================================
+# STARTUP
+# ============================================================
 
 async def main():
-    runner = await start_api()
+    if not TOKEN:
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing. Add it in your Render environment variables."
+        )
+
+    init_database()
+    await start_api()
 
     log.info("Starting Aerin Discord bot...")
-
-    try:
-        await bot.start(TOKEN)
-
-    except discord.HTTPException as error:
-        if error.status == 429:
-            log.error(
-                "Discord returned HTTP 429. "
-                "No automatic login retries will be made. "
-                "The Aerin API will remain online."
-            )
-        else:
-            log.exception(
-                "Discord HTTP error during startup: %s",
-                error.status,
-            )
-
-        await asyncio.Event().wait()
-
-    except discord.LoginFailure:
-        log.exception(
-            "Discord rejected the configured bot token. "
-            "Check the DISCORD_TOKEN environment variable."
-        )
-        await asyncio.Event().wait()
-
-    finally:
-        await bot.close()
-        await runner.cleanup()
+    await bot.start(TOKEN)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Aerin shutting down.")
+        log.info("Aerin stopped.")
