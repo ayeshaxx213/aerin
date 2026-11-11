@@ -34,6 +34,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("aerin")
 
+PINK = discord.Color.from_rgb(245, 174, 204)
+
 
 # ============================================================
 # DATABASE
@@ -112,6 +114,7 @@ def create_or_update_account(discord_id, username, nickname):
         return get_account(discord_id), False
 
     key = make_key()
+
     with db_connect() as db:
         db.execute(
             """
@@ -127,11 +130,8 @@ def create_or_update_account(discord_id, username, nickname):
 
 
 # ============================================================
-# DISCORD EMBEDS
+# EMBEDS
 # ============================================================
-
-PINK = discord.Color.from_rgb(245, 174, 204)
-
 
 def account_embed(account, title="Aerin account"):
     embed = discord.Embed(
@@ -139,15 +139,27 @@ def account_embed(account, title="Aerin account"):
         color=PINK,
         timestamp=datetime.now(timezone.utc)
     )
-    embed.add_field(name="Username", value=account["username"], inline=True)
-    embed.add_field(name="Nickname", value=account["nickname"], inline=True)
-    embed.add_field(name="Account status", value="Registered", inline=False)
+    embed.add_field(
+        name="Username",
+        value=account["username"],
+        inline=True
+    )
+    embed.add_field(
+        name="Nickname",
+        value=account["nickname"],
+        inline=True
+    )
+    embed.add_field(
+        name="Account status",
+        value="Registered",
+        inline=False
+    )
     embed.set_footer(text="Aerin account system")
     return embed
 
 
 # ============================================================
-# REGISTER MODAL
+# REGISTRATION MODAL
 # ============================================================
 
 class RegisterModal(discord.ui.Modal, title="Register Aerin account"):
@@ -267,8 +279,8 @@ class AerinPanel(discord.ui.View):
         embed = discord.Embed(
             title="Aerin resource",
             description=(
-                "Your account is registered. Use the Aerin resource link "
-                "below to view the account service response."
+                "Your account is registered. The Aerin endpoint supports "
+                "account verification using a POST request."
             ),
             color=PINK
         )
@@ -279,12 +291,17 @@ class AerinPanel(discord.ui.View):
         )
         embed.add_field(
             name="Status",
-            value="Verified",
+            value="Registered",
             inline=True
         )
         embed.add_field(
-            name="Resource",
-            value=f"[Open Aerin resource]({PUBLIC_URL}/load/aerin)",
+            name="Endpoint",
+            value=f"`{PUBLIC_URL}/load/aerin`",
+            inline=False
+        )
+        embed.add_field(
+            name="Request method",
+            value="`POST` with JSON fields `username` and `key`",
             inline=False
         )
         embed.set_footer(text="Aerin account system")
@@ -339,7 +356,7 @@ bot = AerinBot()
 
 
 # ============================================================
-# DISCORD SLASH COMMANDS
+# SLASH COMMANDS
 # ============================================================
 
 @bot.tree.command(
@@ -352,7 +369,7 @@ async def panel(interaction: discord.Interaction):
         title="Aerin",
         description=(
             "Register your account, retrieve your key, "
-            "or open the Aerin resource."
+            "or view the Aerin verification endpoint."
         ),
         color=PINK
     )
@@ -411,11 +428,10 @@ async def generatekey(
 
     try:
         await member.send(embed=embed)
-        dm_status = "The account was created and its details were sent by DM."
+        dm_status = "Account details were sent by DM."
     except discord.Forbidden:
         dm_status = (
-            "The account was created, but I could not DM the member. "
-            "They can use Get Key in the panel."
+            "I could not DM the member. They can use Get Key in the panel."
         )
 
     await interaction.response.send_message(
@@ -425,7 +441,7 @@ async def generatekey(
 
 
 # ============================================================
-# API RESPONSE HELPERS
+# API HELPERS
 # ============================================================
 
 def json_response(data, status=200):
@@ -447,20 +463,26 @@ async def health(request):
     })
 
 
-async def verify(request):
+async def verify_credentials(request):
     try:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError):
-        return json_response({
+        return None, json_response({
             "success": False,
             "reason": "Invalid JSON."
+        }, 400)
+
+    if not isinstance(payload, dict):
+        return None, json_response({
+            "success": False,
+            "reason": "JSON body must be an object."
         }, 400)
 
     username = str(payload.get("username", "")).strip()
     key = str(payload.get("key", "")).strip()
 
     if not username or not key:
-        return json_response({
+        return None, json_response({
             "success": False,
             "reason": "Username and key are required."
         }, 400)
@@ -468,10 +490,19 @@ async def verify(request):
     account = get_account_by_credentials(username, key)
 
     if not account:
-        return json_response({
+        return None, json_response({
             "success": False,
             "reason": "Invalid username or key."
         }, 401)
+
+    return account, None
+
+
+async def verify(request):
+    account, error = await verify_credentials(request)
+
+    if error:
+        return error
 
     return json_response({
         "success": True,
@@ -482,14 +513,27 @@ async def verify(request):
 
 
 async def load_aerin(request):
-    # Returns account-service information only.
-    # Does not return executable code or an executor payload.
+    if request.method == "GET":
+        return json_response({
+            "service": "Aerin",
+            "endpoint": "/load/aerin",
+            "method": "POST",
+            "required_fields": ["username", "key"],
+            "status": "online",
+            "note": "This endpoint verifies Aerin accounts only."
+        })
+
+    account, error = await verify_credentials(request)
+
+    if error:
+        return error
+
     return json_response({
         "success": True,
-        "service": "Aerin",
-        "status": "online",
-        "message": "Aerin resource endpoint is working.",
-        "verification_endpoint": f"{PUBLIC_URL}/verify"
+        "username": account["username"],
+        "nickname": account["nickname"],
+        "status": "verified",
+        "message": "Aerin account verified successfully."
     })
 
 
@@ -499,6 +543,7 @@ def create_web_app():
     app.router.add_get("/health", health)
     app.router.add_post("/verify", verify)
     app.router.add_get("/load/aerin", load_aerin)
+    app.router.add_post("/load/aerin", load_aerin)
     return app
 
 
