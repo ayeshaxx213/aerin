@@ -112,7 +112,11 @@ def verify_password(password, salt_hex, expected_hash):
     if not salt_hex or not expected_hash:
         return False
 
-    salt = bytes.fromhex(salt_hex)
+    try:
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        return False
+
     digest = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
@@ -120,10 +124,7 @@ def verify_password(password, salt_hex, expected_hash):
         PASSWORD_ITERATIONS
     )
 
-    return hmac.compare_digest(
-        digest.hex(),
-        expected_hash
-    )
+    return hmac.compare_digest(digest.hex(), expected_hash)
 
 
 def get_account(discord_id):
@@ -275,6 +276,32 @@ def create_admin_account(discord_id, nickname):
     return get_account(discord_id)
 
 
+def reset_account_access(discord_id):
+    """Clear password credentials while keeping the account and key."""
+    with db_connect() as db:
+        account = db.execute(
+            "SELECT * FROM accounts WHERE discord_id = ?",
+            (str(discord_id),)
+        ).fetchone()
+
+        if not account:
+            return None
+
+        db.execute(
+            """
+            UPDATE accounts
+            SET password_salt = NULL,
+                password_hash = NULL
+            WHERE discord_id = ?
+            """,
+            (str(discord_id),)
+        )
+
+        db.commit()
+
+    return get_account(discord_id)
+
+
 # ============================================================
 # EMBEDS
 # ============================================================
@@ -392,6 +419,125 @@ class RegisterModal(discord.ui.Modal, title="Register Aerin account"):
             embed=embed,
             ephemeral=True
         )
+
+
+# ============================================================
+# RESET ACCESS CONFIRMATION
+# ============================================================
+
+class ResetAccessConfirmView(discord.ui.View):
+
+    def __init__(self, requester_id, target):
+        super().__init__(timeout=60)
+        self.requester_id = requester_id
+        self.target = target
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the administrator who started this reset can confirm it.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Confirm reset",
+        style=discord.ButtonStyle.danger,
+        custom_id="aerin:confirm_reset"
+    )
+    async def confirm_reset(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        try:
+            account = reset_account_access(self.target.id)
+
+        except sqlite3.Error:
+            log.exception("Account access reset failed")
+            await interaction.response.edit_message(
+                content="A database error occurred. The reset could not be completed.",
+                embed=None,
+                view=None
+            )
+            return
+
+        if not account:
+            await interaction.response.edit_message(
+                content="This member does not have an Aerin account.",
+                embed=None,
+                view=None
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+
+        embed = discord.Embed(
+            title="Aerin access reset",
+            description=(
+                f"Access credentials for {self.target.mention} "
+                "have been reset."
+            ),
+            color=PINK
+        )
+
+        embed.add_field(
+            name="Username",
+            value=account["username"],
+            inline=True
+        )
+
+        embed.add_field(
+            name="Key",
+            value="Unchanged",
+            inline=True
+        )
+
+        embed.add_field(
+            name="Next step",
+            value="The member must use Register to create a new password.",
+            inline=False
+        )
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=embed,
+            view=self
+        )
+
+        try:
+            await self.target.send(
+                "Your Aerin account access has been reset by an administrator. "
+                "Use the Aerin Register button to set up a new password."
+            )
+        except discord.Forbidden:
+            pass
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+        custom_id="aerin:cancel_reset"
+    )
+    async def cancel_reset(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="Account access reset cancelled.",
+            embed=None,
+            view=self
+        )
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
 
 
 # ============================================================
@@ -591,7 +737,6 @@ async def generatekey(
     member: discord.Member,
     nickname: str
 ):
-
     nickname = nickname.strip()
 
     if len(nickname) < 2 or len(nickname) > 32:
@@ -634,6 +779,55 @@ async def generatekey(
 
     await interaction.response.send_message(
         f"Account created for {member.mention}. {message}",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="resetaccess",
+    description="Reset a member's Aerin password access."
+)
+@app_commands.describe(
+    member="The member whose Aerin access should be reset"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def resetaccess(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+    account = get_account(member.id)
+
+    if not account:
+        await interaction.response.send_message(
+            "That member does not have an Aerin account.",
+            ephemeral=True
+        )
+        return
+
+    if not account["password_hash"]:
+        await interaction.response.send_message(
+            "This account already requires password setup. "
+            "The member can use Register to set a password.",
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="Confirm Aerin access reset",
+        description=(
+            f"Are you sure you want to reset access for {member.mention}?\n\n"
+            "Their password credentials will be cleared. "
+            "Their username, nickname, key, and account record will remain."
+        ),
+        color=PINK
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=ResetAccessConfirmView(
+            interaction.user.id,
+            member
+        ),
         ephemeral=True
     )
 
